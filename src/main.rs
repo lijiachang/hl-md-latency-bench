@@ -55,17 +55,42 @@ fn main() {
         .expect("install Ctrl-C handler");
     }
 
-    // (name, url or reason-unavailable)
-    let feeds: Vec<(&'static str, Result<String, String>)> = vec![
-        ("official", Ok(OFFICIAL_WS_URL.to_string())),
+    // (name, feed config or reason-unavailable)
+    let feeds: Vec<(&'static str, Result<FeedConfig, String>)> = vec![
+        (
+            "official",
+            Ok(FeedConfig {
+                name: "official",
+                url: OFFICIAL_WS_URL.to_string(),
+                x_token: None,
+            }),
+        ),
         (
             "quicknode",
             std::env::var("QUICKNODE_WSS_URL")
-                .map(|raw| quicknode_ws_url(&raw))
+                .map(|raw| FeedConfig {
+                    name: "quicknode",
+                    url: quicknode_ws_url(&raw),
+                    x_token: quicknode_x_token(),
+                })
                 .map_err(|_| "env QUICKNODE_WSS_URL not set".to_string()),
         ),
-        ("ob", env_ws_url("OB_WSS_URL")),
-        ("obaws", env_ws_url("OBAWS_WSS_URL")),
+        (
+            "ob",
+            env_ws_url("OB_WSS_URL").map(|url| FeedConfig {
+                name: "ob",
+                url,
+                x_token: None,
+            }),
+        ),
+        (
+            "obaws",
+            env_ws_url("OBAWS_WSS_URL").map(|url| FeedConfig {
+                name: "obaws",
+                url,
+                x_token: None,
+            }),
+        ),
     ];
     let names: Vec<&'static str> = feeds.iter().map(|(n, _)| *n).collect();
 
@@ -82,12 +107,11 @@ fn main() {
     };
 
     let mut workers = Vec::new();
-    for (idx, (name, url)) in feeds.into_iter().enumerate() {
-        match url {
-            Ok(url) => {
+    for (idx, (name, cfg)) in feeds.into_iter().enumerate() {
+        match cfg {
+            Ok(cfg) => {
                 println!("[bench] {name}: connecting");
                 tracing::info!(feed = name, "starting feed");
-                let cfg = FeedConfig { name, url };
                 let coin = args.coin.clone();
                 let tx = tx.clone();
                 let stop = stop.clone();
@@ -145,6 +169,18 @@ fn quicknode_ws_url(raw: &str) -> String {
     }
 }
 
+fn quicknode_x_token() -> Option<String> {
+    [
+        "QUICKNODE_TOKEN",
+        "QUICKNODE_GRPC_TOKEN",
+        "QUICKNODE_API_KEY",
+    ]
+    .into_iter()
+    .find_map(|name| std::env::var(name).ok())
+    .map(|raw| raw.trim().to_string())
+    .filter(|token| !token.is_empty())
+}
+
 fn env_ws_url(name: &str) -> Result<String, String> {
     std::env::var(name)
         .ok()
@@ -155,7 +191,7 @@ fn env_ws_url(name: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{env_ws_url, quicknode_ws_url};
+    use super::{env_ws_url, quicknode_ws_url, quicknode_x_token};
 
     #[test]
     fn self_hosted_url_comes_from_env() {
@@ -184,5 +220,35 @@ mod tests {
             quicknode_ws_url("wss://x.quiknode.pro/t/hypercore/ws"),
             "wss://x.quiknode.pro/t/hypercore/ws"
         );
+    }
+
+    #[test]
+    fn quicknode_token_comes_from_ws_or_grpc_env() {
+        let old_ws = std::env::var("QUICKNODE_TOKEN").ok();
+        let old_grpc = std::env::var("QUICKNODE_GRPC_TOKEN").ok();
+        let old_api = std::env::var("QUICKNODE_API_KEY").ok();
+        std::env::remove_var("QUICKNODE_TOKEN");
+        std::env::remove_var("QUICKNODE_GRPC_TOKEN");
+        std::env::remove_var("QUICKNODE_API_KEY");
+
+        std::env::set_var("QUICKNODE_API_KEY", " api-key ");
+        assert_eq!(quicknode_x_token(), Some("api-key".to_string()));
+        std::env::set_var("QUICKNODE_GRPC_TOKEN", " grpc-token ");
+        assert_eq!(quicknode_x_token(), Some("grpc-token".to_string()));
+        std::env::set_var("QUICKNODE_TOKEN", " ws-token ");
+        assert_eq!(quicknode_x_token(), Some("ws-token".to_string()));
+
+        match old_ws {
+            Some(value) => std::env::set_var("QUICKNODE_TOKEN", value),
+            None => std::env::remove_var("QUICKNODE_TOKEN"),
+        }
+        match old_grpc {
+            Some(value) => std::env::set_var("QUICKNODE_GRPC_TOKEN", value),
+            None => std::env::remove_var("QUICKNODE_GRPC_TOKEN"),
+        }
+        match old_api {
+            Some(value) => std::env::set_var("QUICKNODE_API_KEY", value),
+            None => std::env::remove_var("QUICKNODE_API_KEY"),
+        }
     }
 }

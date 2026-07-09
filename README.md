@@ -5,7 +5,7 @@
 | 链路 | 来源 |
 |---|---|
 | official | `wss://api.hyperliquid.xyz/ws` |
-| quicknode | `$QUICKNODE_WSS_URL` → `…/hypercore/ws`(官方订阅格式透传) |
+| quicknode | `$QUICKNODE_WSS_URL` → `…/hypercore/ws`;可用 `$QUICKNODE_TOKEN`/`$QUICKNODE_GRPC_TOKEN`/`$QUICKNODE_API_KEY` 作为 `x-token` |
 | ob | `$OB_WSS_URL` |
 | obaws | `$OBAWS_WSS_URL` |
 
@@ -14,7 +14,8 @@
 ## 运行
 
 ```bash
-export QUICKNODE_WSS_URL='wss://<endpoint>.quiknode.pro/<token>/'   # 缺失则跳过 quicknode
+export QUICKNODE_WSS_URL='wss://<endpoint>.quiknode.pro/'            # 缺失则跳过 quicknode
+export QUICKNODE_API_KEY='<token>'                                   # 也兼容 QUICKNODE_TOKEN / QUICKNODE_GRPC_TOKEN
 export OB_WSS_URL='wss://<self-hosted-ob-endpoint>/ws?token=<token>' # 缺失则跳过 ob
 export OBAWS_WSS_URL='wss://<self-hosted-obaws-endpoint>/ws?token=<token>' # 缺失则跳过 obaws
 

@@ -5,6 +5,7 @@ use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use tungstenite::client::IntoClientRequest;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
 use url::Url;
@@ -46,6 +47,7 @@ pub enum Event {
 pub struct FeedConfig {
     pub name: &'static str,
     pub url: String,
+    pub x_token: Option<String>,
 }
 
 enum SessionEnd {
@@ -119,7 +121,7 @@ fn session(
     tx: &Sender<Event>,
     stop: &Arc<AtomicBool>,
 ) -> Result<SessionEnd, String> {
-    let mut ws = connect(&cfg.url)?;
+    let mut ws = connect(&cfg.url, cfg.x_token.as_deref())?;
     ws.send(Message::Text(sub_msg.to_string()))
         .map_err(|e| format!("subscribe send failed: {e}"))?;
     tracing::info!(feed = cfg.name, "connected, subscription sent");
@@ -230,7 +232,10 @@ fn log_raw_message(feed_name: &'static str, local_ns: u64, msg: &Message) {
 /// TCP connect with timeout, then TLS + websocket handshake. A plain
 /// `tungstenite::connect` has no connect timeout, which would stall for
 /// minutes on an unreachable self-hosted node.
-fn connect(url_str: &str) -> Result<WebSocket<MaybeTlsStream<TcpStream>>, String> {
+fn connect(
+    url_str: &str,
+    x_token: Option<&str>,
+) -> Result<WebSocket<MaybeTlsStream<TcpStream>>, String> {
     let url = Url::parse(url_str).map_err(|e| format!("bad url: {e}"))?;
     let host = url.host_str().ok_or("url has no host")?.to_string();
     let port = url.port_or_known_default().unwrap_or(443);
@@ -260,7 +265,19 @@ fn connect(url_str: &str) -> Result<WebSocket<MaybeTlsStream<TcpStream>>, String
         .set_write_timeout(Some(HANDSHAKE_READ_TIMEOUT))
         .map_err(|e| e.to_string())?;
 
-    let (ws, _resp) = tungstenite::client_tls(url_str, stream)
+    let mut request = url_str
+        .into_client_request()
+        .map_err(|e| format!("bad websocket request: {e}"))?;
+    if let Some(token) = x_token {
+        request.headers_mut().insert(
+            "x-token",
+            token
+                .parse()
+                .map_err(|e| format!("bad x-token header: {e}"))?,
+        );
+    }
+
+    let (ws, _resp) = tungstenite::client_tls(request, stream)
         .map_err(|e| format!("ws handshake failed: {e}"))?;
 
     // Short read timeout so the loop can tick for pings and stop checks.
