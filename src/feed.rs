@@ -30,6 +30,9 @@ pub enum Event {
         feed: usize,
         time_ms: u64,
         local_ns: u64,
+        /// raw bbo message text; content normalization happens in the
+        /// aggregator thread to keep the receive hot path minimal
+        text: String,
     },
     Disconnect {
         feed: usize,
@@ -155,6 +158,7 @@ fn session(
                                     feed,
                                     time_ms,
                                     local_ns,
+                                    text: txt,
                                 })
                                 .is_err()
                             {

@@ -7,6 +7,51 @@ use crate::feed::Event;
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
+/// One side of the book, normalized for cross-feed content comparison.
+/// px/sz are stored as f64 bit patterns so `"70.0"` and `"70"` compare equal.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SideKey {
+    px_bits: u64,
+    sz_bits: u64,
+    n: u32,
+}
+
+/// Canonical bbo content: (bid, ask); `None` = side absent/null.
+/// Covers both wire formats — official `"bbo":[bid,ask]` and
+/// self-hosted `"bid":{…},"ask":{…}`.
+pub type ContentKey = (Option<SideKey>, Option<SideKey>);
+
+fn side_key(v: &serde_json::Value) -> Option<SideKey> {
+    let px: f64 = v.get("px")?.as_str()?.parse().ok()?;
+    let sz: f64 = v.get("sz")?.as_str()?.parse().ok()?;
+    let n = v.get("n")?.as_u64()? as u32;
+    Some(SideKey {
+        px_bits: px.to_bits(),
+        sz_bits: sz.to_bits(),
+        n,
+    })
+}
+
+/// Normalize a bbo message's content. `None` only when the message cannot be
+/// parsed at all; an empty side maps to `None` inside the key.
+pub fn parse_bbo_content(text: &str) -> Option<ContentKey> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    let data = v.get("data")?;
+    if let Some(arr) = data.get("bbo").and_then(|b| b.as_array()) {
+        Some((
+            arr.first().and_then(side_key),
+            arr.get(1).and_then(side_key),
+        ))
+    } else if data.get("bid").is_some() || data.get("ask").is_some() {
+        Some((
+            data.get("bid").and_then(side_key),
+            data.get("ask").and_then(side_key),
+        ))
+    } else {
+        None
+    }
+}
+
 pub struct FeedStats {
     pub name: &'static str,
     pub subscribed: bool,
@@ -14,11 +59,17 @@ pub struct FeedStats {
     pub raw_msgs: u64,
     pub dup_msgs: u64,
     pub warmup_dropped: u64,
+    pub unparsed_content: u64,
     pub disconnects: u32,
     /// latency (local receive − exchange time), ns, one entry per unique `time_ms`
     pub latencies_ns: Vec<i64>,
-    /// time_ms → first-arrival local timestamp (ns)
+    /// time_ms → first-arrival local timestamp (ns); report 1 granularity
     pub first_arrival: HashMap<u64, u64>,
+    /// (time_ms, normalized bbo content) → first-arrival local ns; report 2
+    /// granularity: only messages with identical content count as "the same
+    /// update", so a feed pushing many intra-block states gains no edge from
+    /// updates other feeds never emit
+    pub content_arrival: HashMap<(u64, ContentKey), u64>,
 }
 
 impl FeedStats {
@@ -30,9 +81,11 @@ impl FeedStats {
             raw_msgs: 0,
             dup_msgs: 0,
             warmup_dropped: 0,
+            unparsed_content: 0,
             disconnects: 0,
             latencies_ns: Vec::new(),
             first_arrival: HashMap::new(),
+            content_arrival: HashMap::new(),
         }
     }
 
@@ -58,19 +111,28 @@ pub fn run_aggregator(
                 feed,
                 time_ms,
                 local_ns,
+                text,
             }) => {
                 let s = &mut stats[feed];
                 s.raw_msgs += 1;
                 if local_ns < measure_start_ns {
                     s.warmup_dropped += 1;
-                } else if let std::collections::hash_map::Entry::Vacant(e) =
-                    s.first_arrival.entry(time_ms)
+                    continue;
+                }
+                // report 1: first arrival per block time
+                if let std::collections::hash_map::Entry::Vacant(e) = s.first_arrival.entry(time_ms)
                 {
                     e.insert(local_ns);
                     s.latencies_ns
                         .push(local_ns as i64 - time_ms as i64 * 1_000_000);
                 } else {
                     s.dup_msgs += 1;
+                }
+                // report 2: first arrival per (time, exact bbo content)
+                if let Some(key) = parse_bbo_content(&text) {
+                    s.content_arrival.entry((time_ms, key)).or_insert(local_ns);
+                } else {
+                    s.unparsed_content += 1;
                 }
             }
             Ok(Event::Subscribed { feed }) => stats[feed].subscribed = true,
@@ -146,7 +208,10 @@ pub fn render_report(
         out,
         "- 时钟: CLOCK_REALTIME;单链路绝对延迟含本机 NTP 偏差,链路间对比不受影响"
     );
-    let _ = writeln!(out, "- 样本按 (coin, time) 去重,同一 time 只取首达消息\n");
+    let _ = writeln!(
+        out,
+        "- 报告 1 按 (coin, time) 去重取首达;报告 2 按 (time, bbo 内容) 严格匹配\n"
+    );
 
     for s in stats {
         if let Some(reason) = &s.unavailable {
@@ -192,10 +257,15 @@ pub fn render_report(
         );
     }
 
-    // Report 2: pairwise first-arrival comparison
+    // Report 2: pairwise first-arrival comparison, strict content matching
     let _ = writeln!(
         out,
         "\n## 报告 2:跨链路同一更新谁先到(pairwise,不受时钟偏差影响)\n"
+    );
+    let _ = writeln!(
+        out,
+        "同一更新的判定:`time` **和 bbo 内容(bid/ask 的 px、sz、n)完全一致**才匹配;\
+         自建节点在同一块时间内推送的、其他链路未单独推送的中间状态不参与对比。\n"
     );
     let avail: Vec<&FeedStats> = stats.iter().filter(|s| s.available()).collect();
     if avail.len() < 2 {
@@ -210,8 +280,8 @@ pub fn render_report(
             let mut a_wins = 0u64;
             let mut b_wins = 0u64;
             let mut ties = 0u64;
-            for (time_ms, a_ns) in &a.first_arrival {
-                if let Some(b_ns) = b.first_arrival.get(time_ms) {
+            for (key, a_ns) in &a.content_arrival {
+                if let Some(b_ns) = b.content_arrival.get(key) {
                     let d = *b_ns as i64 - *a_ns as i64;
                     diffs.push(d);
                     match d.cmp(&0) {
@@ -223,7 +293,7 @@ pub fn render_report(
             }
             let _ = writeln!(out, "### {} vs {}\n", a.name, b.name);
             if diffs.is_empty() {
-                let _ = writeln!(out, "无共同 time 样本。\n");
+                let _ = writeln!(out, "无内容一致的共同样本。\n");
                 continue;
             }
             diffs.sort_unstable();
@@ -251,15 +321,19 @@ pub fn render_report(
         }
     }
 
-    // Overall first-arrival ranking across times seen by every available feed
-    let _ = writeln!(out, "### 全交集首达排名(仅统计所有可用链路都收到的 time)\n");
+    // Overall first-arrival ranking across updates seen (with identical
+    // content) by every available feed
+    let _ = writeln!(
+        out,
+        "### 全交集首达排名(仅统计所有可用链路都收到且内容一致的更新)\n"
+    );
     let base = avail[0];
     let mut wins = vec![0u64; avail.len()];
     let mut total = 0u64;
-    for time_ms in base.first_arrival.keys() {
+    for key in base.content_arrival.keys() {
         let arrivals: Option<Vec<u64>> = avail
             .iter()
-            .map(|s| s.first_arrival.get(time_ms).copied())
+            .map(|s| s.content_arrival.get(key).copied())
             .collect();
         let Some(arrivals) = arrivals else { continue };
         total += 1;
@@ -294,7 +368,7 @@ pub fn render_report(
 
 #[cfg(test)]
 mod tests {
-    use super::percentile_ns;
+    use super::{parse_bbo_content, percentile_ns};
 
     #[test]
     fn percentile_edges() {
@@ -303,5 +377,34 @@ mod tests {
         assert_eq!(percentile_ns(&sorted, 50.0), 51); // round(0.5*99)=50 -> value 51
         assert_eq!(percentile_ns(&sorted, 100.0), 100);
         assert_eq!(percentile_ns(&[42], 99.0), 42);
+    }
+
+    #[test]
+    fn same_content_across_formats_matches() {
+        // official array format, sz "70.0"
+        let official = r#"{"channel":"bbo","data":{"coin":"ETH","time":1,"bbo":[{"px":"1745.8","sz":"70.0","n":18},{"px":"1745.9","sz":"64.2003","n":24}]}}"#;
+        // node object format, numerically identical sz "70"
+        let node = r#"{"channel":"bbo","data":{"coin":"ETH","time":1,"bid":{"px":"1745.8","sz":"70","n":18},"ask":{"px":"1745.9","sz":"64.2003","n":24}}}"#;
+        assert_eq!(parse_bbo_content(official), parse_bbo_content(node));
+        assert!(parse_bbo_content(official).is_some());
+    }
+
+    #[test]
+    fn different_content_does_not_match() {
+        let a = r#"{"channel":"bbo","data":{"coin":"ETH","time":1,"bid":{"px":"1745.8","sz":"70","n":18},"ask":{"px":"1745.9","sz":"64.2003","n":24}}}"#;
+        let b = r#"{"channel":"bbo","data":{"coin":"ETH","time":1,"bid":{"px":"1745.8","sz":"71","n":18},"ask":{"px":"1745.9","sz":"64.2003","n":24}}}"#;
+        assert_ne!(parse_bbo_content(a), parse_bbo_content(b));
+    }
+
+    #[test]
+    fn null_side_and_garbage() {
+        // one-sided book: official null bid
+        let one_sided = r#"{"channel":"bbo","data":{"coin":"X","time":1,"bbo":[null,{"px":"2","sz":"3","n":1}]}}"#;
+        let key = parse_bbo_content(one_sided).unwrap();
+        assert!(key.0.is_none());
+        assert!(key.1.is_some());
+        // unparsable content
+        assert_eq!(parse_bbo_content("not json"), None);
+        assert_eq!(parse_bbo_content(r#"{"channel":"pong"}"#), None);
     }
 }
