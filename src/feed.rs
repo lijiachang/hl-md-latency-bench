@@ -132,51 +132,53 @@ fn session(
         }
 
         match ws.read() {
-            Ok(Message::Text(txt)) => {
+            Ok(msg) => {
                 let local_ns = now_realtime_ns();
-                if txt.contains(r#""channel":"bbo""#) {
-                    if !subscribed {
-                        subscribed = true;
-                        let _ = tx.send(Event::Subscribed { feed });
-                    }
-                    if let Some(time_ms) = extract_time_ms(&txt) {
-                        let latency_ns = local_ns as i64 - time_ms as i64 * 1_000_000;
-                        tracing::info!(
-                            target: "sample",
-                            feed = cfg.name,
-                            time_ms,
-                            local_ns,
-                            latency_ns
-                        );
-                        if tx
-                            .send(Event::Sample {
-                                feed,
+                log_raw_message(cfg.name, local_ns, &msg);
+                if let Message::Text(txt) = msg {
+                    if txt.contains(r#""channel":"bbo""#) {
+                        if !subscribed {
+                            subscribed = true;
+                            let _ = tx.send(Event::Subscribed { feed });
+                        }
+                        if let Some(time_ms) = extract_time_ms(&txt) {
+                            let latency_ns = local_ns as i64 - time_ms as i64 * 1_000_000;
+                            tracing::info!(
+                                target: "sample",
+                                feed = cfg.name,
                                 time_ms,
                                 local_ns,
-                            })
-                            .is_err()
-                        {
-                            let _ = ws.close(None);
-                            return Ok(SessionEnd::Stopped);
+                                latency_ns
+                            );
+                            if tx
+                                .send(Event::Sample {
+                                    feed,
+                                    time_ms,
+                                    local_ns,
+                                })
+                                .is_err()
+                            {
+                                let _ = ws.close(None);
+                                return Ok(SessionEnd::Stopped);
+                            }
+                        } else {
+                            tracing::warn!(feed = cfg.name, msg = %txt, "bbo message without parsable time");
                         }
-                    } else {
-                        tracing::warn!(feed = cfg.name, msg = %txt, "bbo message without parsable time");
+                    } else if txt.contains(r#""channel":"subscriptionResponse""#) {
+                        if !subscribed {
+                            subscribed = true;
+                            let _ = tx.send(Event::Subscribed { feed });
+                        }
+                        tracing::info!(feed = cfg.name, "subscription confirmed");
+                    } else if txt.contains(r#""channel":"error""#) {
+                        if !subscribed {
+                            return Err(format!("subscription rejected: {txt}"));
+                        }
+                        tracing::warn!(feed = cfg.name, msg = %txt, "error message from feed");
                     }
-                } else if txt.contains(r#""channel":"subscriptionResponse""#) {
-                    if !subscribed {
-                        subscribed = true;
-                        let _ = tx.send(Event::Subscribed { feed });
-                    }
-                    tracing::info!(feed = cfg.name, "subscription confirmed");
-                } else if txt.contains(r#""channel":"error""#) {
-                    if !subscribed {
-                        return Err(format!("subscription rejected: {txt}"));
-                    }
-                    tracing::warn!(feed = cfg.name, msg = %txt, "error message from feed");
                 }
                 // pong and anything else: ignore
             }
-            Ok(_) => {} // binary/ping/pong control frames (pings answered by tungstenite)
             Err(tungstenite::Error::Io(e))
                 if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
             {
@@ -199,6 +201,25 @@ fn session(
                 .map_err(|e| format!("ping send failed: {e}"))?;
             last_ping = Instant::now();
         }
+    }
+}
+
+fn log_raw_message(feed_name: &'static str, local_ns: u64, msg: &Message) {
+    match msg {
+        Message::Text(txt) => tracing::info!(
+            target: "raw_msg",
+            feed = feed_name,
+            local_ns,
+            "raw websocket message: {}",
+            txt
+        ),
+        _ => tracing::info!(
+            target: "raw_msg",
+            feed = feed_name,
+            local_ns,
+            raw = ?msg,
+            "raw websocket message"
+        ),
     }
 }
 
@@ -284,7 +305,51 @@ pub fn extract_time_ms(msg: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_time_ms;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    use tungstenite::Message;
+
+    use super::{extract_time_ms, log_raw_message};
+
+    #[derive(Clone)]
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn raw_websocket_message_log_contains_payload() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let writer_buf = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || SharedWriter(writer_buf.clone()))
+            .with_ansi(false)
+            .with_target(false)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            log_raw_message(
+                "official",
+                123,
+                &Message::Text(r#"{"channel":"pong"}"#.to_string()),
+            );
+        });
+
+        let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("raw websocket message"));
+        assert!(output.contains("feed=\"official\""));
+        assert!(output.contains("local_ns=123"));
+        assert!(output.contains(r#"{"channel":"pong"}"#));
+    }
 
     #[test]
     fn extracts_time_from_official_format() {

@@ -22,8 +22,9 @@ cargo run --release -- --coin ETH --duration-secs 60   # 短测
 ```
 
 Ctrl-C 可提前结束并输出报告。报告打印到 stdout 并写入 `report_<时间戳>.md`;
-逐条消息的原始记录(feed / time_ms / local_ns / latency_ns)经 tracing-appender
-异步写入 `logs/bench.log`,可供离线复查。
+每条成功读到的 WebSocket 原始消息经 tracing-appender 非阻塞写入
+`logs/bench.log`;可解析 bbo 样本另写 feed / time_ms / local_ns / latency_ns,
+可供离线复查。
 
 ## 公平性设计
 
