@@ -177,16 +177,59 @@ fn ms(ns: i64) -> String {
     format!("{:.3}", ns as f64 / 1_000_000.0)
 }
 
-fn dist_row(sorted: &[i64]) -> String {
-    format!(
-        "{} | {} | {} | {} | {} | {}",
+fn dist_cells(sorted: &[i64]) -> Vec<String> {
+    vec![
         ms(sorted[0]),
         ms(percentile_ns(sorted, 25.0)),
         ms(percentile_ns(sorted, 50.0)),
         ms(percentile_ns(sorted, 75.0)),
         ms(percentile_ns(sorted, 99.0)),
         ms(sorted[sorted.len() - 1]),
+    ]
+}
+
+fn display_width(s: &str) -> usize {
+    s.chars().map(|c| if is_wide(c) { 2 } else { 1 }).sum()
+}
+
+fn is_wide(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x1100..=0x115f
+            | 0x2e80..=0xa4cf
+            | 0xac00..=0xd7a3
+            | 0xf900..=0xfaff
+            | 0xfe10..=0xfe6f
+            | 0xff00..=0xffe6
     )
+}
+
+fn write_table(out: &mut String, headers: &[&str], rows: &[Vec<String>]) {
+    let mut widths: Vec<usize> = headers.iter().map(|h| display_width(h)).collect();
+    for row in rows {
+        for (i, cell) in row.iter().enumerate() {
+            widths[i] = widths[i].max(display_width(cell));
+        }
+    }
+
+    write_table_row(out, headers.iter().copied(), &widths);
+    let separators: Vec<String> = widths.iter().map(|w| "-".repeat((*w).max(3))).collect();
+    write_table_row(out, separators.iter().map(String::as_str), &widths);
+    for row in rows {
+        write_table_row(out, row.iter().map(String::as_str), &widths);
+    }
+}
+
+fn write_table_row<'a>(out: &mut String, cells: impl Iterator<Item = &'a str>, widths: &[usize]) {
+    let _ = write!(out, "|");
+    for (cell, width) in cells.zip(widths) {
+        let _ = write!(
+            out,
+            " {cell}{} |",
+            " ".repeat(width.saturating_sub(display_width(cell)))
+        );
+    }
+    let _ = writeln!(out);
 }
 
 pub fn render_report(
@@ -202,33 +245,26 @@ pub fn render_report(
     let _ = writeln!(out, "- 币种: {coin}");
     let _ = writeln!(
         out,
-        "- 有效测量时长: {measured_secs:.0}s(预热丢弃前 {warmup_secs}s)"
+        "- 有效测量时长: {measured_secs:.0}s (预热丢弃前 {warmup_secs}s)"
     );
     let _ = writeln!(
         out,
-        "- 时钟: CLOCK_REALTIME;单链路绝对延迟含本机 NTP 偏差,链路间对比不受影响"
+        "- 时钟: CLOCK_REALTIME; 单链路绝对延迟含本机 NTP 偏差, 链路间对比不受影响"
     );
     let _ = writeln!(
         out,
-        "- 报告 1 按 (coin, time) 去重取首达;报告 2 按 (time, bbo 内容) 严格匹配\n"
+        "- 报告 1 按 (coin, time) 去重取首达; 报告 2 按 (time, bbo 内容) 严格匹配\n"
     );
 
     for s in stats {
         if let Some(reason) = &s.unavailable {
-            let _ = writeln!(out, "> ⚠️ 链路 `{}` 不可用,已跳过: {}", s.name, reason);
+            let _ = writeln!(out, "> ⚠️ 链路 `{}` 不可用, 已跳过: {}", s.name, reason);
         }
     }
 
     // Report 1: per-feed latency distribution
-    let _ = writeln!(
-        out,
-        "\n## 报告 1:单链路延迟(local_time − msg.time,单位 ms)\n"
-    );
-    let _ = writeln!(
-        out,
-        "| 链路 | 样本(去重) | 原始消息 | 重复 | 断线 | min | p25 | p50 | p75 | p99 | max |"
-    );
-    let _ = writeln!(out, "|---|---|---|---|---|---|---|---|---|---|---|");
+    let _ = writeln!(out, "\n## 报告 1: 单链路延迟 (local_time - msg.time, ms)\n");
+    let mut latency_rows = Vec::new();
     for s in stats {
         if !s.available() {
             let status = if s.unavailable.is_some() {
@@ -236,43 +272,68 @@ pub fn render_report(
             } else {
                 "no data"
             };
-            let _ = writeln!(
-                out,
-                "| {} | {} | {} | {} | {} | - | - | - | - | - | - |",
-                s.name, status, s.raw_msgs, s.dup_msgs, s.disconnects
-            );
+            latency_rows.push(vec![
+                s.name.to_string(),
+                status.to_string(),
+                s.raw_msgs.to_string(),
+                s.dup_msgs.to_string(),
+                s.disconnects.to_string(),
+                "-".to_string(),
+                "-".to_string(),
+                "-".to_string(),
+                "-".to_string(),
+                "-".to_string(),
+                "-".to_string(),
+            ]);
             continue;
         }
         let mut sorted = s.latencies_ns.clone();
         sorted.sort_unstable();
-        let _ = writeln!(
-            out,
-            "| {} | {} | {} | {} | {} | {} |",
-            s.name,
-            sorted.len(),
-            s.raw_msgs,
-            s.dup_msgs,
-            s.disconnects,
-            dist_row(&sorted),
-        );
+        let mut row = vec![
+            s.name.to_string(),
+            sorted.len().to_string(),
+            s.raw_msgs.to_string(),
+            s.dup_msgs.to_string(),
+            s.disconnects.to_string(),
+        ];
+        row.extend(dist_cells(&sorted));
+        latency_rows.push(row);
     }
+    write_table(
+        &mut out,
+        &[
+            "链路",
+            "样本(去重)",
+            "原始消息",
+            "重复",
+            "断线",
+            "min",
+            "p25",
+            "p50",
+            "p75",
+            "p99",
+            "max",
+        ],
+        &latency_rows,
+    );
 
     // Report 2: pairwise first-arrival comparison, strict content matching
     let _ = writeln!(
         out,
-        "\n## 报告 2:跨链路同一更新谁先到(pairwise,不受时钟偏差影响)\n"
+        "\n## 报告 2: 跨链路同一更新谁先到 (pairwise, 不受时钟偏差影响)\n"
     );
     let _ = writeln!(
         out,
-        "同一更新的判定:`time` **和 bbo 内容(bid/ask 的 px、sz、n)完全一致**才匹配;\
+        "同一更新的判定: `time` 和 bbo 内容 (bid/ask 的 px、sz、n) 完全一致才匹配；\
          自建节点在同一块时间内推送的、其他链路未单独推送的中间状态不参与对比。\n"
     );
     let avail: Vec<&FeedStats> = stats.iter().filter(|s| s.available()).collect();
     if avail.len() < 2 {
-        let _ = writeln!(out, "可用链路不足 2 条,无法做 pairwise 对比。");
+        let _ = writeln!(out, "可用链路不足 2 条, 无法做 pairwise 对比。");
         return out;
     }
 
+    let mut pair_rows = Vec::new();
     for i in 0..avail.len() {
         for j in (i + 1)..avail.len() {
             let (a, b) = (avail[i], avail[j]);
@@ -291,41 +352,62 @@ pub fn render_report(
                     }
                 }
             }
-            let _ = writeln!(out, "### {} vs {}\n", a.name, b.name);
             if diffs.is_empty() {
-                let _ = writeln!(out, "无内容一致的共同样本。\n");
+                pair_rows.push(vec![
+                    format!("{} vs {}", a.name, b.name),
+                    "0".to_string(),
+                    "-".to_string(),
+                    "-".to_string(),
+                    "-".to_string(),
+                    "-".to_string(),
+                    "-".to_string(),
+                    "-".to_string(),
+                    "-".to_string(),
+                    "-".to_string(),
+                    "-".to_string(),
+                ]);
                 continue;
             }
             diffs.sort_unstable();
             let n = diffs.len() as f64;
-            let _ = writeln!(out, "- 匹配样本: {}", diffs.len());
-            let _ = writeln!(
-                out,
-                "- {} 先到: {} ({:.1}%),{} 先到: {} ({:.1}%),同时: {}",
-                a.name,
-                a_wins,
-                a_wins as f64 / n * 100.0,
-                b.name,
-                b_wins,
-                b_wins as f64 / n * 100.0,
-                ties
-            );
-            let _ = writeln!(
-                out,
-                "- 到达时差 ({} − {},ms,正数 = {} 更快):",
-                b.name, a.name, a.name
-            );
-            let _ = writeln!(out, "\n| min | p25 | p50 | p75 | p99 | max |");
-            let _ = writeln!(out, "|---|---|---|---|---|---|");
-            let _ = writeln!(out, "| {} |\n", dist_row(&diffs));
+            let mut row = vec![
+                format!("{} vs {}", a.name, b.name),
+                diffs.len().to_string(),
+                format!("{} ({:.1}%)", a_wins, a_wins as f64 / n * 100.0),
+                format!("{} ({:.1}%)", b_wins, b_wins as f64 / n * 100.0),
+                ties.to_string(),
+            ];
+            row.extend(dist_cells(&diffs));
+            pair_rows.push(row);
         }
     }
+    let _ = writeln!(
+        out,
+        "Δ = 右侧链路到达时间 - 左侧链路到达时间 (ms); 正数表示左侧更快。\n"
+    );
+    write_table(
+        &mut out,
+        &[
+            "对比",
+            "匹配样本",
+            "左侧先到",
+            "右侧先到",
+            "同时",
+            "Δ min",
+            "Δ p25",
+            "Δ p50",
+            "Δ p75",
+            "Δ p99",
+            "Δ max",
+        ],
+        &pair_rows,
+    );
 
     // Overall first-arrival ranking across updates seen (with identical
     // content) by every available feed
     let _ = writeln!(
         out,
-        "### 全交集首达排名(仅统计所有可用链路都收到且内容一致的更新)\n"
+        "\n### 全交集首达排名 (仅统计所有可用链路都收到且内容一致的更新)\n"
     );
     let base = avail[0];
     let mut wins = vec![0u64; avail.len()];
@@ -349,26 +431,24 @@ pub fn render_report(
         let _ = writeln!(out, "无全交集样本。");
     } else {
         let _ = writeln!(out, "全交集样本: {total}\n");
-        let _ = writeln!(out, "| 链路 | 首达次数 | 首达率 |");
-        let _ = writeln!(out, "|---|---|---|");
         let mut ranked: Vec<(usize, u64)> = wins.iter().copied().enumerate().collect();
         ranked.sort_by_key(|(_, w)| std::cmp::Reverse(*w));
+        let mut ranking_rows = Vec::new();
         for (k, w) in ranked {
-            let _ = writeln!(
-                out,
-                "| {} | {} | {:.1}% |",
-                avail[k].name,
-                w,
-                w as f64 / total as f64 * 100.0
-            );
+            ranking_rows.push(vec![
+                avail[k].name.to_string(),
+                w.to_string(),
+                format!("{:.1}%", w as f64 / total as f64 * 100.0),
+            ]);
         }
+        write_table(&mut out, &["链路", "首达次数", "首达率"], &ranking_rows);
     }
     out
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_bbo_content, percentile_ns};
+    use super::{parse_bbo_content, percentile_ns, render_report, FeedStats};
 
     #[test]
     fn percentile_edges() {
@@ -406,5 +486,42 @@ mod tests {
         // unparsable content
         assert_eq!(parse_bbo_content("not json"), None);
         assert_eq!(parse_bbo_content(r#"{"channel":"pong"}"#), None);
+    }
+
+    #[test]
+    fn report_uses_padded_tables_and_pairwise_summary() {
+        let stats = vec![
+            sample_feed("official", 1_000_200_000),
+            sample_feed("quicknode", 1_000_150_000),
+        ];
+        let report = render_report(&stats, "ETH", 17.0, 5);
+
+        assert!(report.contains("- 有效测量时长: 17s (预热丢弃前 5s)"));
+        assert!(report.contains("## 报告 1: 单链路延迟"));
+        assert!(report.contains("| 链路      | 样本(去重) | 原始消息 |"));
+        assert!(report.contains("| quicknode | 1          | 1        |"));
+        assert!(report.contains("## 报告 2: 跨链路同一更新谁先到"));
+        assert!(
+            report.contains("| 对比                  | 匹配样本 | 左侧先到 | 右侧先到   | 同时 |")
+        );
+        assert!(
+            report.contains("| official vs quicknode | 1        | 0 (0.0%) | 1 (100.0%) | 0    |")
+        );
+        assert!(!report.contains("### official vs quicknode\n\n- 匹配样本"));
+    }
+
+    fn sample_feed(name: &'static str, local_ns: u64) -> FeedStats {
+        let mut stats = FeedStats::new(name);
+        let time_ms = 1_000;
+        let msg = r#"{"channel":"bbo","data":{"coin":"ETH","time":1000,"bbo":[{"px":"1","sz":"2","n":3},{"px":"4","sz":"5","n":6}]}}"#;
+        stats.raw_msgs = 1;
+        stats
+            .latencies_ns
+            .push(local_ns as i64 - time_ms * 1_000_000);
+        stats.first_arrival.insert(time_ms as u64, local_ns);
+        stats
+            .content_arrival
+            .insert((time_ms as u64, parse_bbo_content(msg).unwrap()), local_ns);
+        stats
     }
 }
