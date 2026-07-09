@@ -168,10 +168,11 @@ enum FeedKind {
 /// <https://www.quicknode.com/docs/hyperliquid/datasets/bbo-book>
 ///
 /// Endpoint candidates, in priority order:
-/// 1. `QUICKNODE_GRPC_URL` as given (scheme normalized to https)
-/// 2. from `QUICKNODE_RPC_URL` / `QUICKNODE_WSS_URL` host: `https://<host>:10000`,
-///    plus the `<name>.hype-mainnet.quiknode.pro:10000` variant the QuickNode
-///    docs use for HyperCore endpoints
+/// 1. `QUICKNODE_GRPC_ENDPOINT` / `QUICKNODE_GRPC_URL` as given
+///    (scheme normalized to https)
+/// 2. from `QUICKNODE_RPC_URL` / `QUICKNODE_WSS_URL` host: first the
+///    `<name>.hype-mainnet.quiknode.pro:10000` variant the QuickNode docs use
+///    for HyperCore endpoints, then `https://<host>:10000` as fallback
 ///
 /// Token candidates: `QUICKNODE_TOKEN` / `QUICKNODE_GRPC_TOKEN` /
 /// `QUICKNODE_API_KEY` env vars, then the URL path token. The gRPC feed tries
@@ -179,16 +180,18 @@ enum FeedKind {
 fn quicknode_grpc_config() -> Result<GrpcFeedConfig, String> {
     let mut endpoints: Vec<String> = Vec::new();
     let mut tokens: Vec<String> = Vec::new();
+    let mut path_token = None;
 
-    if let Some(raw) = env_nonempty("QUICKNODE_GRPC_URL") {
-        endpoints.push(normalize_grpc_endpoint(&raw));
+    for name in ["QUICKNODE_GRPC_ENDPOINT", "QUICKNODE_GRPC_URL"] {
+        if let Some(raw) = env_nonempty(name) {
+            push_unique(&mut endpoints, normalize_grpc_endpoint(&raw));
+        }
     }
 
     let base_url = env_nonempty("QUICKNODE_RPC_URL").or_else(|| env_nonempty("QUICKNODE_WSS_URL"));
     if let Some(raw) = &base_url {
         if let Ok(url) = url::Url::parse(raw) {
             if let Some(host) = url.host_str() {
-                push_unique(&mut endpoints, format!("https://{host}:10000"));
                 if let Some(name) = host.strip_suffix(".quiknode.pro") {
                     if !name.contains('.') {
                         push_unique(
@@ -197,12 +200,13 @@ fn quicknode_grpc_config() -> Result<GrpcFeedConfig, String> {
                         );
                     }
                 }
+                push_unique(&mut endpoints, format!("https://{host}:10000"));
             }
             if let Some(token) = url
                 .path_segments()
                 .and_then(|mut segs| segs.find(|s| !s.is_empty()))
             {
-                push_unique(&mut tokens, token.to_string());
+                path_token = Some(token.to_string());
             }
         }
     }
@@ -216,9 +220,12 @@ fn quicknode_grpc_config() -> Result<GrpcFeedConfig, String> {
             push_unique(&mut tokens, token);
         }
     }
+    if let Some(token) = path_token {
+        push_unique(&mut tokens, token);
+    }
     if endpoints.is_empty() {
         return Err(
-            "no QuickNode gRPC endpoint (set QUICKNODE_GRPC_URL or QUICKNODE_RPC_URL)".to_string(),
+            "no QuickNode gRPC endpoint (set QUICKNODE_GRPC_ENDPOINT, QUICKNODE_GRPC_URL, or QUICKNODE_RPC_URL)".to_string(),
         );
     }
     if tokens.is_empty() {
@@ -297,6 +304,7 @@ mod tests {
 
     const QN_KEYS: &[&str] = &[
         "QUICKNODE_GRPC_URL",
+        "QUICKNODE_GRPC_ENDPOINT",
         "QUICKNODE_RPC_URL",
         "QUICKNODE_WSS_URL",
         "QUICKNODE_TOKEN",
@@ -324,8 +332,8 @@ mod tests {
         assert_eq!(
             cfg.endpoints,
             vec![
-                "https://sleek-light-star.quiknode.pro:10000".to_string(),
                 "https://sleek-light-star.hype-mainnet.quiknode.pro:10000".to_string(),
+                "https://sleek-light-star.quiknode.pro:10000".to_string(),
             ]
         );
         assert_eq!(cfg.tokens, vec!["abc123".to_string()]);
@@ -343,7 +351,17 @@ mod tests {
         );
         assert_eq!(
             cfg.tokens,
-            vec!["abc123".to_string(), "tok-env".to_string()]
+            vec!["tok-env".to_string(), "abc123".to_string()]
+        );
+
+        std::env::set_var(
+            "QUICKNODE_GRPC_ENDPOINT",
+            "caerus-ep.hype-mainnet.quiknode.pro:10000",
+        );
+        let cfg = quicknode_grpc_config().unwrap();
+        assert_eq!(
+            cfg.endpoints[0],
+            "https://caerus-ep.hype-mainnet.quiknode.pro:10000"
         );
     }
 

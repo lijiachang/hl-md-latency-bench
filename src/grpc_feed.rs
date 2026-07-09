@@ -159,12 +159,12 @@ async fn session(
     let channel = Endpoint::from_shared(endpoint.to_string())
         .map_err(|e| format!("bad endpoint: {e}"))?
         .tls_config(ClientTlsConfig::new())
-        .map_err(|e| format!("tls config failed: {e}"))?
+        .map_err(|e| format!("tls config failed: {}", format_error_chain(&e)))?
         .tcp_nodelay(true)
         .connect_timeout(CONNECT_TIMEOUT)
         .connect()
         .await
-        .map_err(|e| format!("connect failed: {e}"))?;
+        .map_err(|e| format!("connect failed: {}", format_error_chain(&e)))?;
 
     let mut client =
         OrderBookStreamingClient::new(channel).accept_compressed(CompressionEncoding::Gzip);
@@ -180,7 +180,7 @@ async fn session(
     let mut stream = client
         .stream_bbo_book(request)
         .await
-        .map_err(|e| format!("stream start failed: {e}"))?
+        .map_err(|e| format!("stream start failed: {}", format_error_chain(&e)))?
         .into_inner();
     tracing::info!(
         feed = name,
@@ -232,7 +232,7 @@ async fn session(
                 };
             }
             Ok(Err(status)) => {
-                let reason = format!("stream error: {status}");
+                let reason = format!("stream error: {}", format_error_chain(&status));
                 return if subscribed {
                     Ok(SessionEnd::Lost(reason))
                 } else {
@@ -241,6 +241,20 @@ async fn session(
             }
         }
     }
+}
+
+fn format_error_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut msg = err.to_string();
+    let mut source = err.source();
+    while let Some(err) = source {
+        let next = err.to_string();
+        if !next.is_empty() && !msg.contains(&next) {
+            msg.push_str(": ");
+            msg.push_str(&next);
+        }
+        source = err.source();
+    }
+    msg
 }
 
 /// Render a BboBookUpdate as the self-hosted-node JSON shape so the

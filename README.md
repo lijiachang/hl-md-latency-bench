@@ -5,7 +5,7 @@
 | 链路 | 协议 | 来源 |
 |---|---|---|
 | official | ws | `wss://api.hyperliquid.xyz/ws` |
-| quicknode | **gRPC StreamBboBook**(端口 10000,bbo 数据集仅 gRPC 提供) | `$QUICKNODE_GRPC_URL` 或由 `$QUICKNODE_RPC_URL`/`$QUICKNODE_WSS_URL` 推导 |
+| quicknode | **gRPC StreamBboBook**(端口 10000,bbo 数据集仅 gRPC 提供) | `$QUICKNODE_GRPC_ENDPOINT`/`$QUICKNODE_GRPC_URL` 或由 `$QUICKNODE_RPC_URL`/`$QUICKNODE_WSS_URL` 推导 |
 | ob | ws | `$OB_WSS_URL` |
 | obaws | ws | `$OBAWS_WSS_URL` |
 
@@ -15,7 +15,8 @@
 
 ```bash
 # QuickNode(缺失则跳过):gRPC endpoint 可显式指定,或由 RPC/WSS URL 推导
-export QUICKNODE_GRPC_URL='<endpoint>.hype-mainnet.quiknode.pro:10000'  # 可选,显式指定
+export QUICKNODE_GRPC_ENDPOINT='<endpoint>.hype-mainnet.quiknode.pro:10000' # 可选,兼容 caerus
+export QUICKNODE_GRPC_URL='<endpoint>.hype-mainnet.quiknode.pro:10000'      # 可选,显式指定
 export QUICKNODE_RPC_URL='https://<endpoint>.quiknode.pro/<token>/'     # 或由此推导 host:10000 与 path token
 export QUICKNODE_TOKEN='<token>'                                        # 可选;也兼容 QUICKNODE_GRPC_TOKEN / QUICKNODE_API_KEY
 
@@ -29,9 +30,9 @@ cargo run --release -- --coin ETH --duration-secs 60   # 短测
 QuickNode 的 bbo(StreamBboBook)**只在 gRPC 上提供**(文档:
 <https://www.quicknode.com/docs/hyperliquid/datasets/bbo-book>),鉴权用
 `x-token` metadata。由于各套餐的 endpoint host / token 形态不一,程序会把
-候选 (endpoint, token) 组合逐一尝试(`QUICKNODE_GRPC_URL` 原样、
-`https://<host>:10000`、`https://<name>.hype-mainnet.quiknode.pro:10000` ×
-URL path token、各 token 环境变量),固定用第一个真正吐出数据的组合;全部
+候选 (endpoint, token) 组合逐一尝试(`QUICKNODE_GRPC_ENDPOINT`/`QUICKNODE_GRPC_URL` 原样、
+`https://<name>.hype-mainnet.quiknode.pro:10000`、`https://<host>:10000` ×
+各 token 环境变量、URL path token),固定用第一个真正吐出数据的组合;全部
 失败则该链路标记 unavailable,原因见 `logs/bench.log`。构建需要本机安装
 `protoc`(macOS: `brew install protobuf`;Ubuntu: `apt install protobuf-compiler`)。
 
