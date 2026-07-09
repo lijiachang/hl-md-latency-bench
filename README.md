@@ -6,8 +6,8 @@
 |---|---|
 | official | `wss://api.hyperliquid.xyz/ws` |
 | quicknode | `$QUICKNODE_WSS_URL` → `…/hypercore/ws`(官方订阅格式透传) |
-| ob | `wss://<redacted-ob-host>/ws?token=…` |
-| obaws | `wss://<redacted-obaws-host>/ws?token=…` |
+| ob | `$OB_WSS_URL` |
+| obaws | `$OBAWS_WSS_URL` |
 
 连不上的链路(重试 3 次后)自动标记 unavailable 并跳过,其余链路照常对比。
 
@@ -15,7 +15,8 @@
 
 ```bash
 export QUICKNODE_WSS_URL='wss://<endpoint>.quiknode.pro/<token>/'   # 缺失则跳过 quicknode
-export HL_NODE_TOKEN='<自建节点 token>'                              # 可选,有默认值
+export OB_WSS_URL='wss://<self-hosted-ob-endpoint>/ws?token=<token>' # 缺失则跳过 ob
+export OBAWS_WSS_URL='wss://<self-hosted-obaws-endpoint>/ws?token=<token>' # 缺失则跳过 obaws
 
 cargo run --release                          # 默认 ETH,10 分钟
 cargo run --release -- --coin ETH --duration-secs 60   # 短测

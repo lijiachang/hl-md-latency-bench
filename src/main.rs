@@ -12,9 +12,6 @@ use crate::clock::now_realtime_ns;
 use crate::feed::{Event, FeedConfig};
 
 const OFFICIAL_WS_URL: &str = "wss://api.hyperliquid.xyz/ws";
-const OB_HOST: &str = "<redacted-ob-host>";
-const OBAWS_HOST: &str = "<redacted-obaws-host>";
-const DEFAULT_NODE_TOKEN: &str = "<redacted-token>";
 
 /// Compare HyperLiquid bbo market-data latency across four websocket feeds:
 /// official, QuickNode (hypercore ws), and two self-hosted nodes (ob / obaws).
@@ -58,8 +55,6 @@ fn main() {
         .expect("install Ctrl-C handler");
     }
 
-    let node_token =
-        std::env::var("HL_NODE_TOKEN").unwrap_or_else(|_| DEFAULT_NODE_TOKEN.to_string());
     // (name, url or reason-unavailable)
     let feeds: Vec<(&'static str, Result<String, String>)> = vec![
         ("official", Ok(OFFICIAL_WS_URL.to_string())),
@@ -69,11 +64,8 @@ fn main() {
                 .map(|raw| quicknode_ws_url(&raw))
                 .map_err(|_| "env QUICKNODE_WSS_URL not set".to_string()),
         ),
-        ("ob", Ok(format!("wss://{OB_HOST}/ws?token={node_token}"))),
-        (
-            "obaws",
-            Ok(format!("wss://{OBAWS_HOST}/ws?token={node_token}")),
-        ),
+        ("ob", env_ws_url("OB_WSS_URL")),
+        ("obaws", env_ws_url("OBAWS_WSS_URL")),
     ];
     let names: Vec<&'static str> = feeds.iter().map(|(n, _)| *n).collect();
 
@@ -93,8 +85,8 @@ fn main() {
     for (idx, (name, url)) in feeds.into_iter().enumerate() {
         match url {
             Ok(url) => {
-                println!("[bench] {name}: connecting {url}");
-                tracing::info!(feed = name, url, "starting feed");
+                println!("[bench] {name}: connecting");
+                tracing::info!(feed = name, "starting feed");
                 let cfg = FeedConfig { name, url };
                 let coin = args.coin.clone();
                 let tx = tx.clone();
@@ -153,9 +145,34 @@ fn quicknode_ws_url(raw: &str) -> String {
     }
 }
 
+fn env_ws_url(name: &str) -> Result<String, String> {
+    std::env::var(name)
+        .ok()
+        .map(|raw| raw.trim().to_string())
+        .filter(|url| !url.is_empty())
+        .ok_or_else(|| format!("env {name} not set"))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::quicknode_ws_url;
+    use super::{env_ws_url, quicknode_ws_url};
+
+    #[test]
+    fn self_hosted_url_comes_from_env() {
+        let key = "HL_MD_LATENCY_BENCH_TEST_OB_URL";
+        std::env::remove_var(key);
+        assert_eq!(env_ws_url(key), Err(format!("env {key} not set")));
+
+        std::env::set_var(key, "  wss://node.example/ws?token=secret  ");
+        assert_eq!(
+            env_ws_url(key),
+            Ok("wss://node.example/ws?token=secret".to_string())
+        );
+
+        std::env::set_var(key, "   ");
+        assert_eq!(env_ws_url(key), Err(format!("env {key} not set")));
+        std::env::remove_var(key);
+    }
 
     #[test]
     fn quicknode_url_normalization() {
