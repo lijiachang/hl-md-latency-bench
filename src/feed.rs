@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tungstenite::client::IntoClientRequest;
+use tungstenite::handshake::{HandshakeError, HandshakeRole};
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
 use url::Url;
@@ -278,7 +279,7 @@ fn connect(
     }
 
     let (ws, _resp) = tungstenite::client_tls(request, stream)
-        .map_err(|e| format!("ws handshake failed: {e}"))?;
+        .map_err(|e| format!("ws handshake failed: {}", format_handshake_error(e)))?;
 
     // Short read timeout so the loop can tick for pings and stop checks.
     if let Some(tcp) = tcp_stream(&ws) {
@@ -286,6 +287,29 @@ fn connect(
             .map_err(|e| e.to_string())?;
     }
     Ok(ws)
+}
+
+fn format_ws_error(err: &tungstenite::Error) -> String {
+    let tungstenite::Error::Http(resp) = err else {
+        return err.to_string();
+    };
+    let mut msg = format!("HTTP error: {}", resp.status());
+    if let Some(body) = resp.body().as_ref().filter(|body| !body.is_empty()) {
+        let body = String::from_utf8_lossy(body);
+        let body = body.trim();
+        if !body.is_empty() {
+            msg.push_str(": ");
+            msg.push_str(body);
+        }
+    }
+    msg
+}
+
+fn format_handshake_error<S: HandshakeRole>(err: HandshakeError<S>) -> String {
+    match err {
+        HandshakeError::Failure(err) => format_ws_error(&err),
+        other => other.to_string(),
+    }
 }
 
 fn tcp_stream(ws: &WebSocket<MaybeTlsStream<TcpStream>>) -> Option<&TcpStream> {
@@ -331,7 +355,7 @@ mod tests {
 
     use tungstenite::Message;
 
-    use super::{extract_time_ms, log_raw_message};
+    use super::{extract_time_ms, format_ws_error, log_raw_message};
 
     #[derive(Clone)]
     struct SharedWriter(Arc<Mutex<Vec<u8>>>);
@@ -388,5 +412,18 @@ mod tests {
     fn missing_time_returns_none() {
         assert_eq!(extract_time_ms(r#"{"channel":"pong"}"#), None);
         assert_eq!(extract_time_ms(r#"{"data":{"time":}}"#), None);
+    }
+
+    #[test]
+    fn websocket_http_error_includes_response_body() {
+        let mut response = tungstenite::handshake::client::Response::new(Some(
+            br#"{"error":"Network mismatch. Consider adding the ChainPrism add-on to your endpoint."}"#
+                .to_vec(),
+        ));
+        *response.status_mut() = tungstenite::http::StatusCode::UNAUTHORIZED;
+        let err = tungstenite::Error::Http(response);
+
+        assert!(format_ws_error(&err).contains("401 Unauthorized"));
+        assert!(format_ws_error(&err).contains("Network mismatch"));
     }
 }

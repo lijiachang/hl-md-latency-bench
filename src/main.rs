@@ -1,5 +1,6 @@
 mod clock;
 mod feed;
+mod grpc_feed;
 mod stats;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,11 +11,13 @@ use clap::Parser;
 
 use crate::clock::now_realtime_ns;
 use crate::feed::{Event, FeedConfig};
+use crate::grpc_feed::GrpcFeedConfig;
 
 const OFFICIAL_WS_URL: &str = "wss://api.hyperliquid.xyz/ws";
 
-/// Compare HyperLiquid bbo market-data latency across four websocket feeds:
-/// official, QuickNode (hypercore ws), and two self-hosted nodes (ob / obaws).
+/// Compare HyperLiquid bbo market-data latency across four feeds:
+/// official ws, QuickNode gRPC StreamBboBook, and two self-hosted node ws
+/// endpoints (ob / obaws).
 #[derive(Parser)]
 struct Args {
     /// Coin to subscribe (Hyperliquid perp naming, e.g. ETH, BTC, HYPE)
@@ -56,39 +59,34 @@ fn main() {
     }
 
     // (name, feed config or reason-unavailable)
-    let feeds: Vec<(&'static str, Result<FeedConfig, String>)> = vec![
+    let feeds: Vec<(&'static str, Result<FeedKind, String>)> = vec![
         (
             "official",
-            Ok(FeedConfig {
+            Ok(FeedKind::Ws(FeedConfig {
                 name: "official",
                 url: OFFICIAL_WS_URL.to_string(),
                 x_token: None,
-            }),
+            })),
         ),
-        (
-            "quicknode",
-            std::env::var("QUICKNODE_WSS_URL")
-                .map(|raw| FeedConfig {
-                    name: "quicknode",
-                    url: quicknode_ws_url(&raw),
-                    x_token: quicknode_x_token(),
-                })
-                .map_err(|_| "env QUICKNODE_WSS_URL not set".to_string()),
-        ),
+        ("quicknode", quicknode_grpc_config().map(FeedKind::Grpc)),
         (
             "ob",
-            env_ws_url("OB_WSS_URL").map(|url| FeedConfig {
-                name: "ob",
-                url,
-                x_token: None,
+            env_ws_url("OB_WSS_URL").map(|url| {
+                FeedKind::Ws(FeedConfig {
+                    name: "ob",
+                    url,
+                    x_token: None,
+                })
             }),
         ),
         (
             "obaws",
-            env_ws_url("OBAWS_WSS_URL").map(|url| FeedConfig {
-                name: "obaws",
-                url,
-                x_token: None,
+            env_ws_url("OBAWS_WSS_URL").map(|url| {
+                FeedKind::Ws(FeedConfig {
+                    name: "obaws",
+                    url,
+                    x_token: None,
+                })
             }),
         ),
     ];
@@ -109,7 +107,7 @@ fn main() {
     let mut workers = Vec::new();
     for (idx, (name, cfg)) in feeds.into_iter().enumerate() {
         match cfg {
-            Ok(cfg) => {
+            Ok(kind) => {
                 println!("[bench] {name}: connecting");
                 tracing::info!(feed = name, "starting feed");
                 let coin = args.coin.clone();
@@ -117,7 +115,10 @@ fn main() {
                 let stop = stop.clone();
                 let handle = std::thread::Builder::new()
                     .name(format!("feed-{name}"))
-                    .spawn(move || feed::run_feed(idx, cfg, coin, tx, stop))
+                    .spawn(move || match kind {
+                        FeedKind::Ws(cfg) => feed::run_feed(idx, cfg, coin, tx, stop),
+                        FeedKind::Grpc(cfg) => grpc_feed::run_grpc_feed(idx, cfg, coin, tx, stop),
+                    })
                     .expect("spawn feed thread");
                 workers.push(handle);
             }
@@ -157,28 +158,102 @@ fn main() {
     println!("[bench] 报告已写入 {}", path.display());
 }
 
-/// Normalize a QuickNode endpoint URL (`wss://host/<token>/`) to the
-/// HyperCore websocket path used by the official QuickNode SDK:
-/// `wss://host/<token>/hypercore/ws`.
-fn quicknode_ws_url(raw: &str) -> String {
-    let trimmed = raw.trim().trim_end_matches('/');
-    if trimmed.ends_with("/hypercore/ws") {
-        trimmed.to_string()
-    } else {
-        format!("{trimmed}/hypercore/ws")
-    }
+enum FeedKind {
+    Ws(FeedConfig),
+    Grpc(GrpcFeedConfig),
 }
 
-fn quicknode_x_token() -> Option<String> {
-    [
+/// Build the QuickNode gRPC StreamBboBook config. QuickNode's bbo dataset is
+/// gRPC-only (port 10000, `x-token` metadata):
+/// <https://www.quicknode.com/docs/hyperliquid/datasets/bbo-book>
+///
+/// Endpoint candidates, in priority order:
+/// 1. `QUICKNODE_GRPC_URL` as given (scheme normalized to https)
+/// 2. from `QUICKNODE_RPC_URL` / `QUICKNODE_WSS_URL` host: `https://<host>:10000`,
+///    plus the `<name>.hype-mainnet.quiknode.pro:10000` variant the QuickNode
+///    docs use for HyperCore endpoints
+///
+/// Token candidates: `QUICKNODE_TOKEN` / `QUICKNODE_GRPC_TOKEN` /
+/// `QUICKNODE_API_KEY` env vars, then the URL path token. The gRPC feed tries
+/// every (endpoint, token) pair and pins the first that streams data.
+fn quicknode_grpc_config() -> Result<GrpcFeedConfig, String> {
+    let mut endpoints: Vec<String> = Vec::new();
+    let mut tokens: Vec<String> = Vec::new();
+
+    if let Some(raw) = env_nonempty("QUICKNODE_GRPC_URL") {
+        endpoints.push(normalize_grpc_endpoint(&raw));
+    }
+
+    let base_url = env_nonempty("QUICKNODE_RPC_URL").or_else(|| env_nonempty("QUICKNODE_WSS_URL"));
+    if let Some(raw) = &base_url {
+        if let Ok(url) = url::Url::parse(raw) {
+            if let Some(host) = url.host_str() {
+                push_unique(&mut endpoints, format!("https://{host}:10000"));
+                if let Some(name) = host.strip_suffix(".quiknode.pro") {
+                    if !name.contains('.') {
+                        push_unique(
+                            &mut endpoints,
+                            format!("https://{name}.hype-mainnet.quiknode.pro:10000"),
+                        );
+                    }
+                }
+            }
+            if let Some(token) = url
+                .path_segments()
+                .and_then(|mut segs| segs.find(|s| !s.is_empty()))
+            {
+                push_unique(&mut tokens, token.to_string());
+            }
+        }
+    }
+
+    for name in [
         "QUICKNODE_TOKEN",
         "QUICKNODE_GRPC_TOKEN",
         "QUICKNODE_API_KEY",
-    ]
-    .into_iter()
-    .find_map(|name| std::env::var(name).ok())
-    .map(|raw| raw.trim().to_string())
-    .filter(|token| !token.is_empty())
+    ] {
+        if let Some(token) = env_nonempty(name) {
+            push_unique(&mut tokens, token);
+        }
+    }
+    if endpoints.is_empty() {
+        return Err(
+            "no QuickNode gRPC endpoint (set QUICKNODE_GRPC_URL or QUICKNODE_RPC_URL)".to_string(),
+        );
+    }
+    if tokens.is_empty() {
+        return Err(
+            "no QuickNode token (set QUICKNODE_TOKEN or use a URL with a token path)".to_string(),
+        );
+    }
+
+    Ok(GrpcFeedConfig {
+        name: "quicknode",
+        endpoints,
+        tokens,
+    })
+}
+
+fn normalize_grpc_endpoint(endpoint: &str) -> String {
+    let trimmed = endpoint.trim().trim_end_matches('/');
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        trimmed.to_string()
+    } else {
+        format!("https://{trimmed}")
+    }
+}
+
+fn env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|raw| raw.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn push_unique(list: &mut Vec<String>, value: String) {
+    if !list.contains(&value) {
+        list.push(value);
+    }
 }
 
 fn env_ws_url(name: &str) -> Result<String, String> {
@@ -191,7 +266,98 @@ fn env_ws_url(name: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{env_ws_url, quicknode_ws_url, quicknode_x_token};
+    use super::{env_ws_url, normalize_grpc_endpoint, quicknode_grpc_config};
+
+    /// Snapshot-and-restore guard so env-var tests don't leak between tests
+    /// (cargo runs them in threads of one process).
+    struct EnvGuard {
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        fn clear(keys: &[&'static str]) -> Self {
+            let saved = keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+            for k in keys {
+                std::env::remove_var(k);
+            }
+            Self { saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.saved {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    const QN_KEYS: &[&str] = &[
+        "QUICKNODE_GRPC_URL",
+        "QUICKNODE_RPC_URL",
+        "QUICKNODE_WSS_URL",
+        "QUICKNODE_TOKEN",
+        "QUICKNODE_GRPC_TOKEN",
+        "QUICKNODE_API_KEY",
+    ];
+
+    // Env-var manipulation is process-global; keep everything that touches
+    // QUICKNODE_* in ONE test to avoid cross-test races.
+    #[test]
+    fn quicknode_grpc_config_derivation() {
+        let _guard = EnvGuard::clear(QN_KEYS);
+
+        // nothing set → unavailable with actionable reason
+        assert!(quicknode_grpc_config()
+            .unwrap_err()
+            .contains("QUICKNODE_GRPC_URL"));
+
+        // RPC URL alone provides both endpoint candidates and the path token
+        std::env::set_var(
+            "QUICKNODE_RPC_URL",
+            "https://sleek-light-star.quiknode.pro/abc123/",
+        );
+        let cfg = quicknode_grpc_config().unwrap();
+        assert_eq!(
+            cfg.endpoints,
+            vec![
+                "https://sleek-light-star.quiknode.pro:10000".to_string(),
+                "https://sleek-light-star.hype-mainnet.quiknode.pro:10000".to_string(),
+            ]
+        );
+        assert_eq!(cfg.tokens, vec!["abc123".to_string()]);
+
+        // explicit gRPC URL takes priority; env tokens appended after path token
+        std::env::set_var(
+            "QUICKNODE_GRPC_URL",
+            "my-ep.hype-mainnet.quiknode.pro:10000",
+        );
+        std::env::set_var("QUICKNODE_TOKEN", " tok-env ");
+        let cfg = quicknode_grpc_config().unwrap();
+        assert_eq!(
+            cfg.endpoints[0],
+            "https://my-ep.hype-mainnet.quiknode.pro:10000"
+        );
+        assert_eq!(
+            cfg.tokens,
+            vec!["abc123".to_string(), "tok-env".to_string()]
+        );
+    }
+
+    #[test]
+    fn grpc_endpoint_normalization() {
+        assert_eq!(
+            normalize_grpc_endpoint("host.quiknode.pro:10000"),
+            "https://host.quiknode.pro:10000"
+        );
+        assert_eq!(
+            normalize_grpc_endpoint("https://host.quiknode.pro:10000/"),
+            "https://host.quiknode.pro:10000"
+        );
+    }
 
     #[test]
     fn self_hosted_url_comes_from_env() {
@@ -208,47 +374,5 @@ mod tests {
         std::env::set_var(key, "   ");
         assert_eq!(env_ws_url(key), Err(format!("env {key} not set")));
         std::env::remove_var(key);
-    }
-
-    #[test]
-    fn quicknode_url_normalization() {
-        assert_eq!(
-            quicknode_ws_url("wss://sleek-light-star.quiknode.pro/abc123/"),
-            "wss://sleek-light-star.quiknode.pro/abc123/hypercore/ws"
-        );
-        assert_eq!(
-            quicknode_ws_url("wss://x.quiknode.pro/t/hypercore/ws"),
-            "wss://x.quiknode.pro/t/hypercore/ws"
-        );
-    }
-
-    #[test]
-    fn quicknode_token_comes_from_ws_or_grpc_env() {
-        let old_ws = std::env::var("QUICKNODE_TOKEN").ok();
-        let old_grpc = std::env::var("QUICKNODE_GRPC_TOKEN").ok();
-        let old_api = std::env::var("QUICKNODE_API_KEY").ok();
-        std::env::remove_var("QUICKNODE_TOKEN");
-        std::env::remove_var("QUICKNODE_GRPC_TOKEN");
-        std::env::remove_var("QUICKNODE_API_KEY");
-
-        std::env::set_var("QUICKNODE_API_KEY", " api-key ");
-        assert_eq!(quicknode_x_token(), Some("api-key".to_string()));
-        std::env::set_var("QUICKNODE_GRPC_TOKEN", " grpc-token ");
-        assert_eq!(quicknode_x_token(), Some("grpc-token".to_string()));
-        std::env::set_var("QUICKNODE_TOKEN", " ws-token ");
-        assert_eq!(quicknode_x_token(), Some("ws-token".to_string()));
-
-        match old_ws {
-            Some(value) => std::env::set_var("QUICKNODE_TOKEN", value),
-            None => std::env::remove_var("QUICKNODE_TOKEN"),
-        }
-        match old_grpc {
-            Some(value) => std::env::set_var("QUICKNODE_GRPC_TOKEN", value),
-            None => std::env::remove_var("QUICKNODE_GRPC_TOKEN"),
-        }
-        match old_api {
-            Some(value) => std::env::set_var("QUICKNODE_API_KEY", value),
-            None => std::env::remove_var("QUICKNODE_API_KEY"),
-        }
     }
 }

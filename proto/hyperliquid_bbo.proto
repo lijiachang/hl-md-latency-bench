@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package hyperliquid;
+
+// Subset of QuickNode's HyperCore OrderBookStreaming service — only the
+// StreamBboBook RPC this bench needs. Wire path must match the server:
+// /hyperliquid.OrderBookStreaming/StreamBboBook
+// Definition from https://www.quicknode.com/docs/hyperliquid/datasets/bbo-book
+service OrderBookStreaming {
+  rpc StreamBboBook(BboBookRequest) returns (stream BboBookUpdate);
+}
+
+message BboBookRequest {
+  // Symbols to subscribe to (e.g. "BTC", "ETH"). Empty means all coins.
+  repeated string coins = 1;
+}
+
+message BboBookUpdate {
+  string coin = 1;
+  // Block timestamp in milliseconds
+  uint64 time = 2;
+  uint64 block_number = 3;
+  // Absent if there is no resting bid/ask
+  L2Level bid = 4;
+  L2Level ask = 5;
+}
+
+message L2Level {
+  string px = 1;
+  string sz = 2;
+  uint32 n = 3;
+}
