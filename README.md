@@ -69,3 +69,7 @@ TLS 用 rustls,无系统依赖,rsync 源码后直接构建:
 rsync -a --exclude target ./ <server>:~/hl-md-latency-bench/
 ssh <server> 'cd ~/hl-md-latency-bench && cargo build --release'
 ```
+
+## 推送验证
+
+2026-09-24：从这台测试机确认可以把提交推到 GitHub。
